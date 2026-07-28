@@ -15,6 +15,11 @@ env/
 # pytest
 .pytest_cache/
 
+# Signature sidecars and demo keys (generated during tests / demos)
+*.sig.json
+demo_keys/
+*.key
+
 # Logs (regenerated on each test run)
 logs/
 

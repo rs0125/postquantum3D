@@ -1,18 +1,20 @@
 # postquantum3D
 
-Cryptographic canonicalization pipeline for 3D meshes. Takes any 3D mesh and produces a deterministic SHA-256 fingerprint that is **invariant to rotation, translation, and uniform scale**.
+Post-quantum provenance pipeline for 3D mesh assets. Produces a **geometry-canonical fingerprint** (SHA-256) that is invariant to rotation, translation, and uniform scale, then binds it to an identity via an **ML-DSA-44** digital signature (FIPS 204 / Dilithium).
 
-Two geometrically identical meshes that differ only by how they were exported (different world-space position, orientation, or scale) will always produce the **exact same hash**.
+Two geometrically identical meshes that differ only by how they were exported will always produce the **exact same hash** — and a single signature covers every possible re-export of that geometry.
 
 ## The Problem
 
-When a 3D mesh passes through an export pipeline — different DCCs (Blender, Maya, Houdini), file formats (OBJ, FBX, glTF), or coordinate conventions (Y-up vs Z-up) — the raw vertex data changes even though the geometry is identical. A mesh translated by `(100, 0, 0)`, scaled by `3x`, and rotated `45` on Y is still the same bunny. But a naive hash of the vertex buffer will be completely different.
+When a 3D mesh passes through an export pipeline — different DCCs (Blender, Maya, Houdini), file formats (OBJ, FBX, glTF), or coordinate conventions (Y-up vs Z-up) — the raw vertex data changes even though the geometry is identical. A mesh translated by `(100, 0, 0)`, scaled by `3x`, and rotated `45°` on Y is still the same bunny. But a naive hash of the vertex buffer will be completely different.
 
-This makes it impossible to answer: *"Is this the same mesh I've seen before?"*
+This makes it impossible to answer: *"Is this the same mesh I signed, or has someone tampered with it?"*
 
 ## The Solution
 
-`MeshCanonicalizer` strips away every degree of freedom that doesn't affect geometry, one at a time:
+### Stage 1: Canonical Fingerprinting
+
+`MeshCanonicalizer` strips away every degree of freedom that doesn't affect geometry:
 
 ```
 Phase 1 — Center        Remove 3 DOF (translation)      Subtract centroid
@@ -23,29 +25,66 @@ Phase 5 — Sort          Remove vertex ordering           Lexicographic sort
 Phase 6 — Hash          Produce fingerprint              SHA-256
 ```
 
-The result is a single 64-character hex string that serves as a canonical identity for the mesh geometry.
+### Stage 2: Post-Quantum Signature
+
+`sign_mesh()` signs the canonical fingerprint with ML-DSA-44 and writes a `.sig.json` sidecar. `verify_mesh()` recomputes the fingerprint from the mesh and checks the signature.
+
+```
+Mesh ──▶ Canonicalize ──▶ SHA-256 ──▶ ML-DSA-44 Sign ──▶ .sig.json
+                                              │
+Mesh ──▶ Canonicalize ──▶ SHA-256 ──▶ ML-DSA-44 Verify ◀─ .sig.json + public key
+                                              │
+                                         True / False
+```
 
 ## Quick Start
 
+### Install Dependencies
+
 ```bash
-pip install trimesh numpy scipy
+pip install trimesh numpy scipy liboqs-python
 ```
+
+`liboqs-python` requires the system `liboqs` library. On Fedora: `sudo dnf install liboqs`. On Ubuntu: see [Open Quantum Safe install guide](https://github.com/open-quantum-safe/liboqs).
 
 ### Python API
 
 ```python
 import trimesh
-from postquantum3d import MeshCanonicalizer
+from postquantum3d import MeshCanonicalizer, generate_keys, sign_mesh, verify_mesh
+from pathlib import Path
 
+# Canonical fingerprinting (no keys needed)
 mesh = trimesh.load("model.obj", force="mesh")
-canon = MeshCanonicalizer(mesh)
-fingerprint = canon.canonicalize()
+fingerprint = MeshCanonicalizer(mesh).canonicalize()
+print(fingerprint)  # e.g. "b50b58d62243bf2ff5fe..."
 
-print(fingerprint)
-# e.g. "b50b58d62243bf2ff5fe1259f0a56389ab4d670f40f1ce5b21ffc4090d7a79f6"
+# Key generation
+generate_keys(Path("keys/"))
+
+# Sign
+sig_path = sign_mesh(Path("model.obj"), Path("keys/private.key"))
+
+# Verify
+is_valid = verify_mesh(Path("model.obj"), Path("keys/public.key"), sig_path)
+assert is_valid
 ```
 
-### CLI
+### Run the Demos
+
+```bash
+# Full tamper-detection showcase (self-contained, no setup needed)
+python demos/04_tamper_detection.py
+
+# Or step-by-step:
+python demos/01_generate_keys.py                          # create ML-DSA-44 keypair
+python demos/02_sign_mesh.py                               # sign all test meshes
+python demos/03_verify_mesh.py                             # verify all test meshes
+python demos/02_sign_mesh.py test_meshes/bunny.obj         # sign one mesh
+python demos/03_verify_mesh.py test_meshes/bunny.obj       # verify one mesh
+```
+
+### CLI (Canonicalization Only)
 
 ```bash
 python src/postquantum3d/canonicalize.py test_meshes/bunny.obj
@@ -69,80 +108,39 @@ mutated.vertices = 42.0 * (np.array(mutated.vertices) @ R.T) + [100, -200, 50]
 h1 = MeshCanonicalizer(mesh).canonicalize()
 h2 = MeshCanonicalizer(mutated).canonicalize()
 
-assert h1 == h2  # Identical hashes
+assert h1 == h2  # Identical hashes — same geometry
 ```
 
 ## How It Works
 
-### Phase 1 — Translation Invariance (Center)
+### Canonicalization Pipeline
 
-Subtract the centroid from all vertices.
+See [docs/02-canonicalization-theory.md](docs/02-canonicalization-theory.md) for the full mathematical treatment.
 
-```
-V' = V + T  →  V' - mean(V') = V - mean(V)
-```
+**Phase 1 — Translation Invariance**: Subtract the centroid. `V' - mean(V') = V - mean(V)`.
 
-The translation `T` cancels out. The mesh is now centered at the origin.
+**Phase 2 — Scale Invariance**: Divide by max radius. `(sV) / max(||sV||) = V / max(||V||)`.
 
-### Phase 2 — Scale Invariance (Normalize)
+**Phase 3 — Rotation Invariance**: PCA alignment with sum-of-cubes sign disambiguation. Falls back to a distance-based invariant for degenerate eigenvalues (cubes, spheres, cylinders).
 
-Divide all vertices by the maximum Euclidean distance from the origin.
+**Phase 4 — Truncation**: Floor to 4 decimal places. Absorbs floating-point non-determinism.
 
-```
-(sV) / max(||sV||) = V / max(||V||)
-```
+**Phase 5 — Sort**: Lexicographic vertex sort. Removes vertex-ordering dependence.
 
-The uniform scale factor `s` cancels out. The mesh is now bounded in a unit sphere.
+**Phase 6 — SHA-256**: Hash the canonical coordinate or distance string.
 
-### Phase 3 — Rotation Invariance (PCA Alignment)
+### Signature Pipeline
 
-Compute the covariance matrix `C = VᵀV / n` and its eigenvectors. Project vertices onto the eigenvector basis to align the mesh to its principal axes.
+See [docs/03-post-quantum-signatures.md](docs/03-post-quantum-signatures.md) for the ML-DSA-44 mathematical background.
 
-```
-C' = (RV)ᵀ(RV) / n = VᵀRᵀRV / n = VᵀV / n = C
-```
+**ML-DSA-44** (FIPS 204) is a lattice-based signature scheme providing NIST Level 2 post-quantum security (~128-bit). It is resistant to Shor's algorithm and provides existential unforgeability under chosen-message attacks (EUF-CMA) in the quantum random oracle model.
 
-The eigenvalues are rotation-invariant, so the alignment undoes any rotation `R`.
-
-**Sign disambiguation**: Eigenvectors are defined up to `±1`. We resolve this by computing `S = Σ(vᵢ · eⱼ)³` for each eigenvector. If `S < 0`, flip the eigenvector. The sum-of-cubes rule is robust to antipodal vertex ties (unlike the simpler argmax rule).
-
-**Degeneracy handling**: When eigenvalues are repeated (perfect cube, sphere, cylinder) or near-zero (coplanar/collinear meshes), PCA cannot produce a stable frame. In these cases, the pipeline switches to a **distance-based invariant path** — see below.
-
-### Phase 4 — Precision Threshold (Truncate)
-
-Truncate all coordinates to 4 decimal places using floor-towards-zero:
-
-```
-truncate(x) = sign(x) · floor(|x| · 10⁴) / 10⁴
-```
-
-This eliminates floating-point non-determinism from different computation orders. A `+0.0` is added to canonicalize IEEE-754 negative zero.
-
-### Phase 5 — Lexicographic Sort
-
-Sort the vertex array by X, then Y, then Z. This removes dependence on the arbitrary vertex ordering in the source file.
-
-### Phase 6 — SHA-256 Hash
-
-Flatten the sorted vertex array into a comma-separated string and compute its SHA-256 digest.
-
-## Two Hashing Paths
-
-### Coordinate Path (default)
-
-Used when all three eigenvalues of the covariance matrix are distinct and non-zero. This is the common case for organic meshes (characters, scanned objects, terrain).
-
-**Pipeline**: Center → Normalize → PCA Align → Truncate → Sort → Hash coordinates
-
-### Distance Path (fallback)
-
-Used when eigenvalues are degenerate (repeated or near-zero). This triggers for geometrically symmetric shapes like perfect cubes, spheres, cylinders, and tetrahedra, as well as coplanar or collinear vertex sets.
-
-Instead of aligning coordinates (which PCA cannot do stably), we hash a **rotation-invariant descriptor**: the sorted list of all pairwise inter-vertex distances plus origin distances, rounded to 4 decimal places.
-
-Pairwise distances are exactly rotation-invariant: `||Rv_i - Rv_j|| = ||v_i - v_j||`. The ~1e-16 float noise from computing distances on rotated coordinates is safely absorbed by rounding at 1e-4 resolution.
-
-**Pipeline**: Center → Normalize → Detect degeneracy → Hash sorted distances
+| Parameter | ML-DSA-44 |
+|---|---|
+| Public key | 1,312 bytes |
+| Secret key | 2,560 bytes |
+| Signature | 2,420 bytes |
+| NIST security level | 2 (~128-bit post-quantum) |
 
 ## What Changes the Hash (and What Doesn't)
 
@@ -153,6 +151,7 @@ Pairwise distances are exactly rotation-invariant: `||Rv_i - Rv_j|| = ||v_i - v_
 | Rotation | No | Phase 3 removes it |
 | Reflection (mirror) | No | Sign disambiguation undoes it |
 | Vertex reordering | No | Phase 5 sorts vertices |
+| Convert OBJ to glTF | No | Vertex positions preserved |
 | Non-uniform scale (stretch) | **Yes** | Changes geometry |
 | Moving a vertex | **Yes** | Changes geometry |
 | Adding/removing vertices | **Yes** | Changes vertex set |
@@ -167,20 +166,33 @@ postquantum3D/
 │   ├── __init__.py
 │   └── postquantum3d/
 │       ├── __init__.py
-│       └── canonicalize.py          # MeshCanonicalizer (the pipeline)
+│       ├── canonicalize.py              # MeshCanonicalizer (geometry pipeline)
+│       └── sign.py                      # ML-DSA-44 sign / verify / keygen
 ├── tests/
 │   ├── __init__.py
-│   ├── test_canonicalize.py         # Invariance tests across 7 OBJ meshes
-│   └── test_edge_cases.py           # Edge cases + negative tests (254 tests)
-├── test_meshes/                     # OBJ test models
-│   ├── armadillo.obj                # Stanford Armadillo   (49,990 verts)
-│   ├── bunny.obj                    # Stanford Bunny       (34,834 verts)
-│   ├── cube.obj                     # Simple cube          (14 verts)
-│   ├── homer.obj                    # Homer Simpson        (6,002 verts)
-│   ├── spot.obj                     # Spot the cow         (3,225 verts)
-│   ├── suzanne.obj                  # Blender Suzanne      (507 verts)
-│   └── teapot.obj                   # Utah Teapot          (3,241 verts)
-├── logs/                            # Pipeline logs (gitignored)
+│   ├── test_canonicalize.py             # Invariance tests (7 meshes × 7 seeds)
+│   ├── test_edge_cases.py              # Edge cases + negative tests
+│   └── test_sign.py                    # Signature pipeline tests
+├── demos/
+│   ├── 01_generate_keys.py            # Generate ML-DSA-44 keypair
+│   ├── 02_sign_mesh.py                # Sign mesh(es)
+│   ├── 03_verify_mesh.py              # Verify mesh(es)
+│   └── 04_tamper_detection.py         # Full showcase (self-contained)
+├── docs/
+│   ├── 01-architecture.md             # System architecture overview
+│   ├── 02-canonicalization-theory.md  # Mathematical foundations
+│   ├── 03-post-quantum-signatures.md  # ML-DSA-44 theory
+│   ├── 04-threat-model.md            # Security analysis
+│   └── 05-provenance-pipeline.md     # Pipeline design & integration
+├── test_meshes/                        # OBJ test models
+│   ├── armadillo.obj                   # Stanford Armadillo   (49,990 verts)
+│   ├── bunny.obj                       # Stanford Bunny       (34,834 verts)
+│   ├── cube.obj                        # Simple cube          (14 verts)
+│   ├── homer.obj                       # Homer Simpson        (6,002 verts)
+│   ├── spot.obj                        # Spot the cow         (3,225 verts)
+│   ├── suzanne.obj                     # Blender Suzanne      (507 verts)
+│   └── teapot.obj                      # Utah Teapot          (3,241 verts)
+├── logs/                               # Pipeline logs (gitignored)
 ├── .gitignore
 └── README.md
 ```
@@ -188,14 +200,17 @@ postquantum3D/
 ## Running Tests
 
 ```bash
-# Run all 254 tests
+# Run all 257 tests
 python -m pytest tests/ -v
 
-# Run just the invariance tests (7 meshes × 7 seeds × 4 test types)
+# Canonicalization invariance tests (70 tests)
 python -m pytest tests/test_canonicalize.py -v
 
-# Run just the edge case + negative tests
+# Edge case + negative tests (184 tests)
 python -m pytest tests/test_edge_cases.py -v
+
+# Signature pipeline tests (3 tests)
+python -m pytest tests/test_sign.py -v
 ```
 
 ### Test Categories
@@ -228,156 +243,73 @@ python -m pytest tests/test_edge_cases.py -v
 | Negative: sensitivity | 1 | 0.005 shift detectable |
 | Guard | 1 | test_meshes/ not empty |
 
-## Known Limitations
+**Signature tests** (`test_sign.py`) — 3 tests
 
-1. **Float64 precision at extreme translations**: At offsets >1e8, centroid subtraction loses enough precision (~1e-7) to affect PCA sign disambiguation. The pipeline is reliable for translations up to ~1e6.
+| Test | What it proves |
+|---|---|
+| `test_end_to_end_verification` | Sign cube.obj → verify returns True |
+| `test_tampered_geometry_fails` | Shift one vertex of bunny.obj → verify returns False |
+| `test_tampered_signature_fails` | Flip one byte in signature → verify returns False |
 
-2. **Distance path is O(n²)**: The pairwise-distance fallback computes n(n-1)/2 distances. This only triggers for meshes with degenerate eigenvalues (geometric primitives, typically <1000 vertices), so it's fast in practice. Organic meshes always take the O(n) coordinate path.
+## Documentation
 
-3. **Reflection invariance**: The pipeline treats a mesh and its mirror image as identical. If chirality discrimination is needed (distinguishing left glove from right glove), it must be added as a post-processing step.
+Research-level documentation is in `docs/`:
 
-4. **Vertex-only**: The pipeline hashes vertex positions only. It does not consider face connectivity, normals, UVs, or vertex colors. Two meshes with identical vertices but different face topology will hash identically.
-
-## Mathematical Details
-
-### Why PCA Works for Rotation Invariance
-
-The covariance matrix of a point cloud is defined as:
-
-```
-C = VᵀV / n
-```
-
-where `V` is the `(n, 3)` centered vertex matrix. For any rotation matrix `R`, the rotated cloud `RV` has covariance:
-
-```
-C' = (RV)ᵀ(RV) / n = VᵀRᵀRV / n = VᵀV / n = C
-```
-
-So `C` and `C'` have identical eigenvalues. The eigenvectors of `C'` are `R` times those of `C`. When we project the rotated vertices onto the eigenvectors of `C'`, the rotation `R` cancels:
-
-```
-V_canonical = (RV) @ eigvecs(C') = (RV) @ (R · eigvecs(C)) = V @ eigvecs(C)
-```
-
-This is why PCA-aligned coordinates are rotation-invariant.
-
-### Why Sum-of-Cubes Beats Argmax for Sign Disambiguation
-
-The original sign rule was: find the vertex with the largest absolute projection onto eigenvector `eⱼ`, and ensure its projection is positive. This fails when two vertices have equal-magnitude but opposite-sign projections (e.g., `+0.7` and `-0.7`). After rotation, floating-point noise can swap which vertex "wins" the `argmax`, flipping the sign decision.
-
-The sum-of-cubes rule computes:
-
-```
-S = Σᵢ (vᵢ · eⱼ)³
-```
-
-Cubing preserves sign, amplifies large projections, and sums over all `n` vertices. A single vertex swap cannot flip the sign of a sum over thousands of terms. The rule fails only when `S` is exactly zero (a perfectly antisymmetric distribution), which is handled by an argmax fallback.
-
-### Why the Distance Path is Necessary
-
-When two eigenvalues are equal (e.g., `λ₁ = λ₂`), the corresponding eigenvectors span a 2D eigenspace. Any orthonormal basis of that eigenspace is equally valid. `numpy.linalg.eigh` returns an arbitrary basis that changes depending on the input matrix — and the rotated covariance matrix, while mathematically identical, differs at the ULP level. This makes the eigenvectors unstable:
-
-```
-Davis-Kahan bound:  sin(θ) ≤ ||ΔC|| / gap
-```
-
-When `gap → 0`, even machine-epsilon perturbations cause large eigenvector rotations. No sign-fixing or moment-based realignment can resolve a continuous `SO(k)` ambiguity with discrete decisions.
-
-The distance path avoids this entirely by never computing a frame. Pairwise distances `||vᵢ - vⱼ||` are exactly rotation-invariant (orthogonal matrices preserve norms). The only noise source is floating-point evaluation of the norm, which is ~1 ULP (~1e-16 for O(1) values) — safely absorbed by rounding at 1e-4.
-
-### Degeneracy Detection Criteria
-
-The pipeline switches to the distance path when any of these hold:
-
-| Condition | Catches | Example |
-|---|---|---|
-| `\|λᵢ\| < 1e-8` | Near-zero eigenvalue (rank-deficient covariance) | Coplanar mesh, collinear mesh |
-| `\|λᵢ - λⱼ\| / max(\|λᵢ\|, \|λⱼ\|) < 1e-6` | Repeated eigenvalues | Perfect cube, sphere, cylinder |
-
-### Truncation vs Rounding
-
-The coordinate path uses **truncation** (floor towards zero):
-
-```
-truncate(x) = sign(x) · floor(|x| · 10⁴) / 10⁴
-```
-
-Truncation is chosen over rounding because rounding has a midpoint ambiguity: values exactly at `0.5 × 10⁻⁴` can round up or down depending on the rounding mode (banker's rounding, round-half-up, etc.). Truncation has no ambiguity — it always moves towards zero.
-
-The distance path uses **rounding** (`round()`, banker's rounding) because:
-1. Distances are always non-negative, avoiding the sign complexity of truncation
-2. The midpoint ambiguity is irrelevant — real distances from rotated float coordinates never land exactly on a `0.5 × 10⁻⁴` boundary
-3. Rounding has better average-case error than truncation, reducing the chance of a distance crossing a precision boundary
-
-### IEEE-754 Negative Zero
-
-After truncation, values near zero can become `-0.0` (e.g., `sign(-1e-16) · floor(0) / 10⁴ = -0.0`). While `-0.0 == 0.0` in Python arithmetic, their string representations differ: `"-0.0000"` vs `"0.0000"`. Since the hash is computed from the string, this would break determinism.
-
-The fix: add `+0.0` to the entire array after truncation. IEEE-754 guarantees `-0.0 + 0.0 = +0.0`.
-
-## Use Cases
-
-- **Asset deduplication**: Identify duplicate meshes in a large asset library regardless of how they were exported or transformed
-- **Content-addressable storage**: Use the hash as a key to store/retrieve mesh data, similar to how Git hashes file contents
-- **Change detection**: Compare hashes across pipeline stages to detect whether geometry was actually modified vs just re-exported
-- **Provenance tracking**: Establish a canonical identity for a mesh that persists across format conversions and coordinate system changes
-- **Mesh comparison in CI/CD**: Automate checks that an export pipeline produces geometrically identical output across versions
+| Document | Content |
+|---|---|
+| [01-architecture.md](docs/01-architecture.md) | System design, module decomposition, data flow, sidecar format, trust model |
+| [02-canonicalization-theory.md](docs/02-canonicalization-theory.md) | Mathematical foundations: PCA alignment proof, sum-of-cubes analysis, distance-path invariance, degeneracy detection, truncation theory |
+| [03-post-quantum-signatures.md](docs/03-post-quantum-signatures.md) | ML-DSA-44 / FIPS 204: MLWE/MSIS hardness, Fiat-Shamir with aborts, security parameters, comparison with classical schemes |
+| [04-threat-model.md](docs/04-threat-model.md) | Security goals, adversary model, attack surface analysis (8 attack vectors), trust boundaries, precision sensitivity analysis |
+| [05-provenance-pipeline.md](docs/05-provenance-pipeline.md) | Design principles, pipeline stages, re-export invariance table, integration patterns (CI/CD, CAS, blockchain, multi-party) |
 
 ## API Reference
 
 ### `MeshCanonicalizer(mesh: trimesh.Trimesh)`
 
-Constructor. Takes a trimesh object. The input mesh is deep-copied and never mutated.
+Constructor. Takes a trimesh object. Deep-copies the input.
 
-**Raises**:
-- `ValueError` — if the mesh has 0 vertices ("empty mesh") or 1 vertex ("single-vertex mesh")
+**Raises**: `ValueError` — if 0 or 1 vertices.
 
 ### `.canonicalize() -> str`
 
-Run the full 6-phase pipeline. Returns a 64-character lowercase hex string (SHA-256 digest).
+Run the full 6-phase pipeline. Returns a 64-char lowercase hex string (SHA-256).
 
-**Raises**:
-- `ValueError` — if all vertices coincide at the origin after centering ("Degenerate mesh: all vertices coincide at origin")
+**Raises**: `ValueError` — if all vertices coincide at the origin.
 
 ### `.hash -> str | None`
 
-The hash from the last `canonicalize()` call, or `None` if not yet called.
+The hash from the last `canonicalize()` call, or `None`.
 
 ### `.vertices -> np.ndarray`
 
-A copy of the internal vertex array (which may be in a partially or fully canonicalized state depending on whether `canonicalize()` has been called).
+Copy of the internal vertex array.
 
-### `PRECISION: int = 4`
+### `generate_keys(key_dir: Path) -> None`
 
-Class attribute. Number of decimal places used for truncation (coordinate path) and rounding (distance path). Can be overridden on the class before instantiation.
+Generate an ML-DSA-44 keypair. Saves `public.key` and `private.key` to `key_dir`.
 
-### Module constant: `EIGEN_TOL: float = 1e-6`
+### `sign_mesh(mesh_path: Path, private_key_path: Path) -> Path`
 
-Relative tolerance for eigenvalue degeneracy detection. Two eigenvalues are considered degenerate if their relative difference is below this threshold.
+Canonicalize a mesh, sign its hash, and write a `.sig.json` sidecar. Returns the sidecar path.
 
-## Logging
+### `verify_mesh(mesh_path: Path, public_key_path: Path, sig_path: Path) -> bool`
 
-The pipeline emits detailed `INFO`-level logs via the `postquantum3d.canonicalize` logger. To see the full phase-by-phase output:
+Recompute the canonical hash and verify the sidecar signature. Returns `True` if valid.
 
-```python
-import logging
-logging.basicConfig(level=logging.INFO)
-```
+## Known Limitations
 
-Example output:
+1. **Float64 precision at extreme translations**: At offsets >1e8, centroid subtraction loses enough precision to affect PCA sign disambiguation. Reliable for translations up to ~1e6.
 
-```
-Phase 1  [Center]       | centroid removed = [-0.027  0.095  0.009]  |  new centroid magnitude = 5.33e-16
-Phase 2  [Normalize]    | scale divisor = 0.11690855  |  new max radius = 1.00000000
-Phase 3  [PCA]          | eigenvalues (desc) = [0.168 0.085 0.052]
-Phase 3  [sign fix]     | axis 2 flipped  (cube_sum=-3.42e-02)
-Phase 4  [Truncate]     | precision = 4 decimal places  |  sample vertex[0] = [ 0.2737  0.118  -0.0399]
-Phase 5  [Sort]         | vertices sorted lexicographically  |  first = [-0.7711  0.2226 -0.0463]  |  last = [0.8787 0.3099 0.3205]
-Phase 6a [Hash:coord]   | string length = 785466 chars  |  SHA-256 = b50b58d62243...
-```
+2. **Distance path is O(n²)**: The pairwise-distance fallback computes n(n-1)/2 distances. Only triggers for degenerate eigenvalue meshes (typically <1000 vertices).
 
-The test suite writes logs to `logs/test_canonicalize.log` for post-run inspection.
+3. **Reflection invariance**: Mirror images produce the same hash. Chirality discrimination must be added as a post-processing step if needed.
+
+4. **Vertex-only**: Ignores face connectivity, normals, UVs, and vertex colors.
+
+5. **No timestamp authority**: The sidecar does not include a trusted timestamp. Replay protection requires an external TSA.
+
+6. **No key revocation**: Key lifecycle management (revocation, rotation, certificate chains) is an orthogonal concern.
 
 ## Dependencies
 
@@ -385,6 +317,25 @@ The test suite writes logs to `logs/test_canonicalize.log` for post-run inspecti
 |---|---|---|---|
 | **numpy** | >= 1.22 | Linear algebra, array ops | Yes |
 | **trimesh** | >= 3.0 | Mesh loading (OBJ, STL, PLY, glTF) | Yes |
+| **liboqs-python** | matching system liboqs | ML-DSA-44 post-quantum signatures | Yes (for signing/verification) |
 | **scipy** | >= 1.7 | `Rotation.random()` for test transforms | Tests only |
 | **pytest** | >= 7.0 | Test runner | Tests only |
 | **Python** | >= 3.10 | `match` statements, `X \| Y` union types | Yes |
+
+## Logging
+
+Both modules emit `INFO`-level logs:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+```
+Phase 1  [Center]       | centroid removed = [-0.027  0.095  0.009]
+Phase 2  [Normalize]    | scale divisor = 0.11690855
+Phase 3  [PCA]          | eigenvalues (desc) = [0.168 0.085 0.052]
+Phase 6a [Hash:coord]   | SHA-256 = b50b58d62243...
+Signed bunny.obj  |  hash=b50b58d62243...  |  sidecar=bunny.obj.sig.json
+Verified bunny.obj  |  result=True  |  local_hash=b50b58d62243...
+```
