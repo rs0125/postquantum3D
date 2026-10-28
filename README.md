@@ -1,5 +1,9 @@
 # postquantum3D
 
+**Live dashboard:** The React + FastAPI application accepts mesh uploads and runs
+the real signing and verification pipeline. See [web/README.md](web/README.md)
+for setup, development commands, and API details.
+
 Post-quantum provenance pipeline for 3D mesh assets. Produces a **geometry-canonical fingerprint** (SHA-256) that is invariant to rotation, translation, and uniform scale, then binds it to an identity via an **ML-DSA-44** digital signature (FIPS 204 / Dilithium).
 
 Two geometrically identical meshes that differ only by how they were exported will always produce the **exact same hash** — and a single signature covers every possible re-export of that geometry.
@@ -162,6 +166,8 @@ See [docs/03-post-quantum-signatures.md](docs/03-post-quantum-signatures.md) for
 
 ```
 postquantum3D/
+├── web/                               # React dashboard and 3D mesh viewer
+├── api/                               # FastAPI upload, signing, and verification API
 ├── src/
 │   ├── __init__.py
 │   └── postquantum3d/
@@ -170,6 +176,7 @@ postquantum3D/
 │       └── sign.py                      # ML-DSA-44 sign / verify / keygen
 ├── tests/
 │   ├── __init__.py
+│   ├── test_api.py                      # Upload and verification API integration tests
 │   ├── test_canonicalize.py             # Invariance tests (7 meshes × 7 seeds)
 │   ├── test_edge_cases.py              # Edge cases + negative tests
 │   └── test_sign.py                    # Signature pipeline tests
@@ -200,8 +207,11 @@ postquantum3D/
 ## Running Tests
 
 ```bash
-# Run all 257 tests
+# Run all tests (install API and test dependencies from web/README.md first)
 python -m pytest tests/ -v
+
+# Upload and verification API integration tests
+python -m pytest tests/test_api.py -v
 
 # Canonicalization invariance tests (70 tests)
 python -m pytest tests/test_canonicalize.py -v
